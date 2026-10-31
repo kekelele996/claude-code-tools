@@ -12,6 +12,13 @@ from rich.spinner import Spinner
 from rich.table import Table
 from rich.text import Text
 
+from claude_code_tools.workflow_cli_diff import (
+    RunDiff,
+    RunSideSummary,
+    SettingComparison,
+    StepComparison,
+    StepSideSummary,
+)
 from claude_code_tools.workflow_cli_identity_policy import (
     colliding_abbreviations,
     display_run_id,
@@ -757,3 +764,304 @@ def fit_live_runs(
     if fitted_footer is not None:
         return fitted_footer
     return smallest_candidate
+
+
+MAX_DIFF_VALUE_CHARS = 160
+MAX_DIFF_ERROR_CHARS = 200
+MAX_DIFF_UNCHANGED_SHOWN = 12
+
+
+def _bounded_diff_text(value: object, *, full: bool) -> str:
+    return bounded_text(
+        value,
+        maximum=MAX_DIFF_VALUE_CHARS,
+        full=full,
+    )[0]
+
+
+def _format_signed_delta(seconds: float | None) -> str:
+    """Format a B-minus-A duration delta with an explicit sign."""
+    if seconds is None:
+        return "—"
+    if abs(seconds) < 0.05:
+        return "0s"
+    sign = "+" if seconds > 0 else "-"
+    return f"{sign}{format_duration(abs(seconds))}"
+
+
+def _diff_side_heading(side: RunSideSummary, label: str) -> Text:
+    """Build one colored run identity line for the compare header."""
+    heading = Text()
+    heading.append(f"{label} ", style="bold")
+    heading.append(
+        _bounded_diff_text(side.abbreviated_id, full=False),
+        style="bold",
+    )
+    heading.append(" · ")
+    heading.append(side.workflow_name)
+    heading.append(" · ")
+    heading.append(
+        side.status,
+        style=STATUS_STYLES.get(side.status, "bright_black"),
+    )
+    return heading
+
+
+def _diff_state_errors(diff: RunDiff) -> list[RenderableType]:
+    """Surface unreadable-state diagnostics without blocking comparison."""
+    renderables: list[RenderableType] = []
+    for label, side in (("A", diff.a), ("B", diff.b)):
+        if side.state_error:
+            error, _ = bounded_text(
+                side.state_error,
+                maximum=MAX_DIFF_ERROR_CHARS,
+                full=False,
+            )
+            renderables.append(
+                Text(f"{label} state unreadable: {error}", style="red", overflow="fold")
+            )
+    return renderables
+
+
+def _diff_settings_table(diff: RunDiff, *, full: bool) -> Table:
+    """Build the run-setting comparison table."""
+    table = Table(box=box.SIMPLE_HEAD, expand=True, show_edge=False)
+    table.add_column("", width=2, no_wrap=True)
+    table.add_column("Setting", style="bold", width=18, no_wrap=True)
+    table.add_column(
+        _bounded_diff_text(diff.a.abbreviated_id, full=False),
+        overflow="fold",
+        ratio=1,
+    )
+    table.add_column(
+        _bounded_diff_text(diff.b.abbreviated_id, full=False),
+        overflow="fold",
+        ratio=1,
+    )
+    for setting in diff.settings:
+        value_a = _diff_setting_text(setting, "a", full=full)
+        value_b = _diff_setting_text(setting, "b", full=full)
+        table.add_row(
+            Text("≠", style="yellow") if setting.changed else "",
+            setting.label,
+            value_a,
+            value_b,
+        )
+    return table
+
+
+def _diff_setting_text(
+    setting: SettingComparison,
+    side: str,
+    *,
+    full: bool,
+) -> Text:
+    """Render one setting value with its difference styling."""
+    value = setting.a if side == "a" else setting.b
+    if value is None:
+        return Text("—", style="bright_black")
+    style = "yellow" if setting.changed else None
+    return Text(_bounded_diff_text(value, full=full), style=style)
+
+
+def _diff_single_side_steps(
+    side_label: str,
+    run_id: str,
+    steps: tuple[StepSideSummary, ...],
+    *,
+    full: bool,
+) -> Panel:
+    """List steps that exist on only one compared run."""
+    rows: list[RenderableType] = []
+    for step in steps:
+        line = Text()
+        line.append(step.id, style="bold")
+        line.append("  ")
+        line.append(
+            step.status,
+            style=STATUS_STYLES.get(step.status, "bright_black"),
+        )
+        attempt = "—" if step.attempt is None else str(step.attempt)
+        line.append(f" · try {attempt} · {format_duration(step.duration_seconds)}")
+        if step.error:
+            error = bounded_text(
+                step.error,
+                maximum=MAX_DIFF_ERROR_CHARS,
+                full=full,
+            )[0]
+            line.append(f" · {error}", style="red")
+        rows.append(line)
+    return Panel(
+        Group(*rows),
+        title=f"Only in {side_label} ({_bounded_diff_text(run_id, full=False)})",
+        border_style="magenta",
+    )
+
+
+def _diff_status_transition(before: str, after: str) -> Text:
+    """Render one colored status transition."""
+    line = Text("status: ")
+    line.append(before, style=STATUS_STYLES.get(before, "bright_black"))
+    line.append(" → ")
+    line.append(after, style=STATUS_STYLES.get(after, "bright_black"))
+    return line
+
+
+def _diff_changed_step(step: StepComparison, *, full: bool) -> Group:
+    """Render one paired step's changed fields."""
+    rows: list[RenderableType] = [Text(step.id, style="bold")]
+    if step.input_changed:
+        rows.append(
+            Text("input changed (fingerprint differs; step re-ran)", style="yellow")
+        )
+    if step.status_changed:
+        rows.append(_diff_status_transition(step.status_a, step.status_b))
+    if step.attempt_changed:
+        attempt_a = "—" if step.attempt_a is None else str(step.attempt_a)
+        attempt_b = "—" if step.attempt_b is None else str(step.attempt_b)
+        rows.append(Text(f"attempt: {attempt_a} → {attempt_b}"))
+    rows.append(
+        Text(
+            "time: "
+            f"{format_duration(step.duration_a)} → "
+            f"{format_duration(step.duration_b)} "
+            f"({_format_signed_delta(step.duration_delta_seconds)})",
+            style="bright_black",
+        )
+    )
+    if step.error_changed:
+        rows.append(Text("error:", style="bold red"))
+        error_a = bounded_text(
+            step.error_a or "—",
+            maximum=MAX_DIFF_ERROR_CHARS,
+            full=full,
+        )[0]
+        error_b = bounded_text(
+            step.error_b or "—",
+            maximum=MAX_DIFF_ERROR_CHARS,
+            full=full,
+        )[0]
+        rows.append(Text(f"  A: {error_a}", style="red", overflow="fold"))
+        rows.append(Text(f"  B: {error_b}", style="red", overflow="fold"))
+    return Group(*rows)
+
+
+def _diff_changed_steps_panel(
+    steps: tuple[StepComparison, ...],
+    *,
+    full: bool,
+) -> Panel:
+    """Render every paired step whose inputs or outcomes changed."""
+    blocks: list[RenderableType] = []
+    for index, step in enumerate(steps):
+        if index:
+            blocks.append(Text(""))
+        blocks.append(_diff_changed_step(step, full=full))
+    return Panel(
+        Group(*blocks),
+        title=f"Changed steps ({len(steps)})",
+        border_style="yellow",
+    )
+
+
+def _diff_unchanged_panel(diff: RunDiff, *, width: int, full: bool) -> Panel:
+    """Group identical steps and report their aggregate timing shift."""
+    unchanged = diff.unchanged
+    rows: list[RenderableType] = [
+        Text(
+            f"{unchanged.count} step{'s' if unchanged.count != 1 else ''} "
+            "unchanged (same input, status, attempts, and error)"
+        )
+    ]
+    if unchanged.duration_delta_seconds is not None:
+        rows.append(
+            Text(
+                "total time delta: "
+                + _format_signed_delta(unchanged.duration_delta_seconds),
+                style="bright_black",
+            )
+        )
+    if unchanged.ids:
+        shown = unchanged.ids if full else unchanged.ids[:MAX_DIFF_UNCHANGED_SHOWN]
+        listing = ", ".join(shown)
+        bounded = bounded_text(
+            listing,
+            maximum=max(20, width - 8),
+            full=full,
+        )[0]
+        rows.append(Text(bounded, style="bright_black", overflow="fold"))
+        if len(shown) < len(unchanged.ids):
+            omitted = len(unchanged.ids) - len(shown)
+            rows.append(
+                Text(
+                    f"{omitted} more omitted; use --full or --json for all steps.",
+                    style="yellow",
+                )
+            )
+    return Panel(Group(*rows), title="Unchanged steps", border_style="green")
+
+
+def build_diff_renderable(
+    diff: RunDiff,
+    *,
+    width: int,
+    full: bool = False,
+    notice: RenderableType | None = None,
+) -> Group:
+    """Build the complete human-readable two-run comparison.
+
+    Args:
+        diff: Coherent typed comparison of two loaded runs.
+        width: Current terminal width for bounded wrapping.
+        full: Whether to disable human-output truncation.
+        notice: Optional watch-mode banner naming the updated side.
+
+    Returns:
+        A renderable beginning with launch settings and continuing with
+        single-side, changed, and unchanged steps.
+    """
+    parts: list[RenderableType] = []
+    if notice is not None:
+        parts.append(notice)
+    parts.append(
+        Panel(
+            Group(
+                _diff_side_heading(diff.a, "A"),
+                _diff_side_heading(diff.b, "B"),
+                *_diff_state_errors(diff),
+            ),
+            title="Comparing runs",
+            border_style="cyan",
+        )
+    )
+    parts.append(Panel(_diff_settings_table(diff, full=full), title="Run settings"))
+    if not any(setting.changed for setting in diff.settings):
+        parts.append(
+            Text(
+                "No differences in working directory, concurrency, or "
+                "invocation limit.",
+                style="green",
+            )
+        )
+    if diff.identical:
+        parts.append(
+            Text(
+                "No differences: the runs match on settings, step inputs, "
+                "statuses, attempts, errors, and step membership.",
+                style="green",
+            )
+        )
+        return Group(*parts)
+    if diff.only_a:
+        parts.append(
+            _diff_single_side_steps("A", diff.a.run_id, diff.only_a, full=full)
+        )
+    if diff.only_b:
+        parts.append(
+            _diff_single_side_steps("B", diff.b.run_id, diff.only_b, full=full)
+        )
+    if diff.changed_steps:
+        parts.append(_diff_changed_steps_panel(diff.changed_steps, full=full))
+    if diff.unchanged.count:
+        parts.append(_diff_unchanged_panel(diff, width=width, full=full))
+    return Group(*parts)

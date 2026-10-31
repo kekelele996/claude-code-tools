@@ -10,6 +10,13 @@ from claude_code_tools.workflow_cli_manifest import (
     STEP_V1_MANIFEST as STEP_V1_MANIFEST,
     V1ObjectManifest as V1ObjectManifest,
 )
+from claude_code_tools.workflow_cli_diff import (
+    RunDiff,
+    RunSideSummary,
+    SettingComparison,
+    StepComparison,
+    StepSideSummary,
+)
 from claude_code_tools.workflow_cli_snapshots import (
     RunQueryResult,
     RunRecord,
@@ -90,6 +97,59 @@ STEP_KEYS = frozenset(
         "error",
     }
 )
+COMPARE_KEYS = frozenset(
+    {
+        "a",
+        "b",
+        "identical",
+        "schemaVersion",
+        "settings",
+        "steps",
+    }
+)
+COMPARE_SIDE_KEYS = frozenset(
+    {
+        "runId",
+        "abbreviatedRunId",
+        "workflowName",
+        "status",
+        "stateError",
+    }
+)
+COMPARE_SETTING_KEYS = frozenset({"field", "a", "b", "changed"})
+COMPARE_STEP_SIDE_KEYS = frozenset(
+    {
+        "id",
+        "label",
+        "status",
+        "attempt",
+        "durationSeconds",
+        "error",
+    }
+)
+COMPARE_STEP_DIFF_KEYS = frozenset(
+    {
+        "id",
+        "labelA",
+        "labelB",
+        "inputKnown",
+        "inputChanged",
+        "statusA",
+        "statusB",
+        "statusChanged",
+        "attemptA",
+        "attemptB",
+        "attemptChanged",
+        "durationSecondsA",
+        "durationSecondsB",
+        "durationDeltaSeconds",
+        "errorA",
+        "errorB",
+        "errorChanged",
+    }
+)
+COMPARE_UNCHANGED_KEYS = frozenset({"count", "ids", "durationDeltaSeconds"})
+COMPARE_STEPS_KEYS = frozenset({"onlyA", "onlyB", "changed", "unchanged"})
 
 
 def _normalize_text(value: str) -> str:
@@ -253,3 +313,92 @@ def list_payload(
 def show_payload(run: RunRecord, now: datetime) -> dict[str, object]:
     """Serialize the complete version-1 show response."""
     return run_payload(run, now, include_steps=True)
+
+
+def compare_side_payload(summary: RunSideSummary) -> dict[str, object]:
+    """Serialize one compared run's identity header."""
+    return _normalize_payload(
+        {
+            "runId": summary.run_id,
+            "abbreviatedRunId": summary.abbreviated_id,
+            "workflowName": summary.workflow_name,
+            "status": summary.status,
+            "stateError": summary.state_error,
+        }
+    )
+
+
+def compare_setting_payload(setting: SettingComparison) -> dict[str, object]:
+    """Serialize one run-level setting comparison."""
+    return _normalize_payload(
+        {
+            "field": setting.field,
+            "a": setting.a,
+            "b": setting.b,
+            "changed": setting.changed,
+        }
+    )
+
+
+def compare_step_side_payload(step: StepSideSummary) -> dict[str, object]:
+    """Serialize one single-side step under the compare contract."""
+    return _normalize_payload(
+        {
+            "id": step.id,
+            "label": step.label,
+            "status": step.status,
+            "attempt": step.attempt,
+            "durationSeconds": step.duration_seconds,
+            "error": step.error,
+        }
+    )
+
+
+def compare_step_diff_payload(step: StepComparison) -> dict[str, object]:
+    """Serialize one paired step's field-by-field comparison."""
+    return _normalize_payload(
+        {
+            "id": step.id,
+            "labelA": step.label_a,
+            "labelB": step.label_b,
+            "inputKnown": step.input_known,
+            "inputChanged": step.input_changed,
+            "statusA": step.status_a,
+            "statusB": step.status_b,
+            "statusChanged": step.status_changed,
+            "attemptA": step.attempt_a,
+            "attemptB": step.attempt_b,
+            "attemptChanged": step.attempt_changed,
+            "durationSecondsA": step.duration_a,
+            "durationSecondsB": step.duration_b,
+            "durationDeltaSeconds": step.duration_delta_seconds,
+            "errorA": step.error_a,
+            "errorB": step.error_b,
+            "errorChanged": step.error_changed,
+        }
+    )
+
+
+def compare_payload(diff: RunDiff) -> dict[str, object]:
+    """Serialize the complete version-1 two-run comparison envelope."""
+    return _normalize_payload(
+        {
+            "schemaVersion": SCHEMA_VERSION,
+            "a": compare_side_payload(diff.a),
+            "b": compare_side_payload(diff.b),
+            "identical": diff.identical,
+            "settings": [compare_setting_payload(setting) for setting in diff.settings],
+            "steps": {
+                "onlyA": [compare_step_side_payload(step) for step in diff.only_a],
+                "onlyB": [compare_step_side_payload(step) for step in diff.only_b],
+                "changed": [
+                    compare_step_diff_payload(step) for step in diff.changed_steps
+                ],
+                "unchanged": {
+                    "count": diff.unchanged.count,
+                    "ids": list(diff.unchanged.ids),
+                    "durationDeltaSeconds": diff.unchanged.duration_delta_seconds,
+                },
+            },
+        }
+    )

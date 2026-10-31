@@ -29,11 +29,23 @@ from claude_code_tools.workflow_cli_rendering import (
     CALLBACK_STYLES as CALLBACK_STYLES,
     MAX_SHOW_STEPS as MAX_SHOW_STEPS,
     STATUS_STYLES as STATUS_STYLES,
+    build_diff_renderable,
     build_runs_table,
     build_show_renderable,
     fit_live_runs,
 )
-from claude_code_tools.workflow_cli_contract import list_payload, show_payload
+from claude_code_tools.workflow_cli_contract import (
+    compare_payload,
+    list_payload,
+    show_payload,
+)
+from claude_code_tools.workflow_cli_diff import (
+    RunDiff,
+    changed_sides,
+    diff_runs,
+    state_signature,
+)
+from claude_code_tools.workflow_cli_snapshots import RunRecord
 from claude_code_tools.workflow_runs import (
     ACTIVE_STATUSES,
     FILTER_STATUSES,
@@ -797,6 +809,231 @@ def show(
         return
     console = _console(bool(context.obj.get("no_color")))
     console.print(build_show_renderable(run, width=console.width, now=now, full=full))
+
+
+@dataclass(frozen=True)
+class _DiffSideRead:
+    """One watch-mode side read, carrying either a record or a diagnostic."""
+
+    record: RunRecord | None
+    read_at: datetime | None
+    error: str | None
+
+
+def _read_diff_side(run_id: str, now: datetime) -> _DiffSideRead:
+    """Load one side for a watch frame without raising resolution errors."""
+    try:
+        lookup = _load_named_run(run_id, now)
+    except click.ClickException as error:
+        return _DiffSideRead(None, None, error.message)
+    if lookup.record is None:
+        return _DiffSideRead(None, None, f"Workflow run not found: {run_id}")
+    return _DiffSideRead(lookup.record, lookup.read_completed_at, None)
+
+
+def _diff_frame(
+    run_id_a: str,
+    run_id_b: str,
+    previous: tuple[object | None, object | None] | None,
+    *,
+    width: int,
+    full: bool,
+) -> tuple[RenderableType, tuple[object | None, object | None]]:
+    """Read both sides fresh and render one coherent non-spliced comparison."""
+    read_a = _read_diff_side(run_id_a, _now())
+    read_b = _read_diff_side(run_id_b, _now())
+    if read_a.error is not None or read_b.error is not None:
+        errors: list[RenderableType] = [
+            Text(
+                "Cannot compare runs; reloading on the next refresh:",
+                style="bold red",
+            )
+        ]
+        if read_a.error is not None:
+            errors.append(Text(f"A: {read_a.error}", style="red", overflow="fold"))
+        if read_b.error is not None:
+            errors.append(Text(f"B: {read_b.error}", style="red", overflow="fold"))
+        return Group(*errors), (
+            None if read_a.record is None else state_signature(read_a.record),
+            None if read_b.record is None else state_signature(read_b.record),
+        )
+    assert read_a.record is not None and read_a.read_at is not None
+    assert read_b.record is not None and read_b.read_at is not None
+    comparison = diff_runs(
+        read_a.record,
+        read_b.record,
+        now_a=read_a.read_at,
+        now_b=read_b.read_at,
+    )
+    current = (
+        state_signature(read_a.record),
+        state_signature(read_b.record),
+    )
+    notice = _diff_change_notice(previous, current, comparison)
+    renderable = build_diff_renderable(
+        comparison,
+        width=width,
+        full=full,
+        notice=notice,
+    )
+    return renderable, current
+
+
+def _diff_change_notice(
+    previous: tuple[object | None, object | None] | None,
+    current: tuple[object | None, object | None],
+    comparison: RunDiff,
+) -> Text:
+    """Name the side that changed since the previous coherent frame."""
+    if previous is None:
+        return Text(
+            "Live comparison; re-reads when either run updates. Ctrl-C to stop.",
+            style="bright_black",
+        )
+    updated = changed_sides(previous, current)
+    if not updated:
+        return Text("No changes since last refresh.", style="bright_black")
+    run_ids = (comparison.a.run_id, comparison.b.run_id)
+    labels = [
+        f"{_diagnostic_text(run_ids[index])} ({'A' if index == 0 else 'B'})"
+        for index in updated
+    ]
+    return Text(
+        f"Updated since last refresh: {', '.join(labels)}",
+        style="cyan",
+    )
+
+
+@cli.command(
+    name="diff",
+    help=(
+        "Compare two durable workflow runs RUN_ID_A and RUN_ID_B: launch "
+        "settings first, then single-side steps and per-step input, status, "
+        "attempt, timing, and error changes; identical steps are grouped. "
+        "Use --watch to re-read both runs whenever either side updates."
+    ),
+)
+@click.argument("run_id_a")
+@click.argument("run_id_b")
+@click.option(
+    "--json",
+    "json_output",
+    is_flag=True,
+    help="Emit the complete versioned comparison JSON.",
+)
+@click.option(
+    "--watch",
+    "watch_changes",
+    is_flag=True,
+    help="Keep re-reading both runs and re-render when either side updates.",
+)
+@click.option(
+    "--refresh",
+    type=_BoundedFloatRange(
+        min=MIN_WATCH_REFRESH,
+        max=MAX_WATCH_REFRESH,
+    ),
+    callback=_finite_refresh,
+    default=1.0,
+    show_default=True,
+    help="Seconds between state-file reads with --watch.",
+)
+@click.option(
+    "--full",
+    is_flag=True,
+    help="Show all grouped step IDs and complete human-readable field values.",
+)
+@click.pass_context
+def diff(
+    context: click.Context,
+    run_id_a: str,
+    run_id_b: str,
+    json_output: bool,
+    watch_changes: bool,
+    refresh: float,
+    full: bool,
+) -> None:
+    """Compare two runs once or continuously, always from coherent pairs.
+
+    Args:
+        context: Active Click context.
+        run_id_a: First run identifier.
+        run_id_b: Second run identifier.
+        json_output: Whether to emit structured comparison JSON.
+        watch_changes: Whether to follow updates from either run.
+        refresh: Seconds between --watch re-reads.
+        full: Whether to disable human-output limits.
+
+    Raises:
+        click.UsageError: If --watch is combined with --json.
+        click.ClickException: If a one-shot side cannot be resolved.
+        click.exceptions.Exit: When a watch session is interrupted.
+    """
+    if watch_changes and json_output:
+        raise click.UsageError(
+            "--json is not supported by diff --watch; use "
+            "codex-workflows diff A B --json for a one-shot comparison."
+        )
+    if not watch_changes:
+        lookup_a = _load_named_run(run_id_a, _now())
+        lookup_b = _load_named_run(run_id_b, _now())
+        assert lookup_a.record is not None and lookup_b.record is not None
+        comparison = diff_runs(
+            lookup_a.record,
+            lookup_b.record,
+            now_a=lookup_a.read_completed_at,
+            now_b=lookup_b.read_completed_at,
+        )
+        if json_output:
+            _emit_json(compare_payload(comparison))
+            return
+        console = _console(bool(context.obj.get("no_color")))
+        console.print(
+            build_diff_renderable(
+                comparison,
+                width=console.width,
+                full=full,
+            )
+        )
+        return
+    no_color = bool(context.obj.get("no_color"))
+    console = _console(no_color)
+    term = os.environ.get("TERM", "").strip().lower()
+    if not _stdout_is_tty() or console.is_dumb_terminal or term in {"dumb", "unknown"}:
+        raise click.ClickException(
+            "diff --watch requires an interactive terminal with live-display "
+            "support; use codex-workflows diff A B --json for one-shot output."
+        )
+    _refresh_console_size(console)
+    initial, previous = _diff_frame(
+        run_id_a,
+        run_id_b,
+        None,
+        width=console.width,
+        full=full,
+    )
+    try:
+        with Live(
+            initial,
+            console=console,
+            auto_refresh=False,
+            screen=True,
+            transient=True,
+        ) as live_display:
+            while True:
+                time.sleep(refresh)
+                _refresh_console_size(console)
+                frame, previous = _diff_frame(
+                    run_id_a,
+                    run_id_b,
+                    previous,
+                    width=console.width,
+                    full=full,
+                )
+                live_display.update(frame, refresh=True)
+    except KeyboardInterrupt:
+        console.print("Stopped comparing workflow runs.")
+        raise click.exceptions.Exit(130) from None
 
 
 def main() -> None:

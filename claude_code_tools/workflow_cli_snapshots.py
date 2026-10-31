@@ -46,6 +46,7 @@ class StepRecord:
     error: str | None
     worker_pid: int | None
     thread_id: str | None
+    fingerprint: str | None = None
 
     def duration_seconds(self, now: datetime) -> float | None:
         """Return this step's nonnegative elapsed or total duration."""
@@ -79,6 +80,8 @@ class RunState:
     pid: int | None = None
     pid_started_at: str | None = None
     terminal_fingerprint: str | None = None
+    concurrency: int | None = None
+    max_agent_invocations: int | None = None
     steps: tuple[StepRecord, ...] = ()
 
 

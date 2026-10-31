@@ -307,6 +307,7 @@ def _normalized_step(
         error="; ".join(errors) if errors else string(value, "error"),
         worker_pid=integer(value, "workerPid"),
         thread_id=string(value, "threadId"),
+        fingerprint=string(value, "fingerprint"),
     )
 
 
@@ -489,6 +490,8 @@ def parse_state(
         pid=pid,
         pid_started_at=pid_started,
         terminal_fingerprint=string(state, "terminalFingerprint"),
+        concurrency=concurrency,
+        max_agent_invocations=max_agent_invocations,
         steps=tuple(
             sorted(
                 normalized_steps,
