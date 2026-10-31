@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 
 import click
 
+from . import cleanup as cleanup_mod
 from .models import AgentKind
 from .store import MsgStore, DEFAULT_DB_PATH, DEFAULT_DB_DIR
 
@@ -715,6 +716,138 @@ def status(ctx: click.Context) -> None:
         seen = _relative_time(a.last_seen)
         click.echo(f"  {a.name} ({a.agent_kind.value}) "
                     f"- last seen {seen}")
+
+    # Retention cleanup
+    try:
+        retention_days = cleanup_mod.retention_days_from_env()
+    except ValueError:
+        click.echo(
+            f"\nCleanup: invalid {cleanup_mod.ENV_RETENTION_DAYS} value"
+        )
+    else:
+        latest = cleanup_mod.latest_audit(store.db_path)
+        if latest:
+            click.echo(
+                f"\nCleanup: retention {retention_days}d, last run "
+                f"{_relative_time(latest['ran_at'])} "
+                f"({latest['status']}, "
+                f"{latest['threads_deleted']} thread(s) deleted)"
+            )
+        else:
+            click.echo(
+                f"\nCleanup: retention {retention_days}d, no runs yet"
+            )
+
+
+@cli.command()
+@click.option(
+    "--days", type=int, default=None,
+    help="Retention days (defaults to MSG_RETENTION_DAYS or 30).",
+)
+@click.option(
+    "--execute", "execute", is_flag=True, default=False,
+    help="Actually delete. Without this flag only show the candidate list.",
+)
+@click.pass_context
+def cleanup(ctx: click.Context, days: int | None, execute: bool) -> None:
+    """Preview or run old-thread cleanup.
+
+    Threads with no message or delivery activity past the retention window
+    are eligible, unless a delivery is pending, claimed, or still in the
+    notified state -- those protect the whole thread. Failed notifications
+    do not.
+
+    Preview first, then run the same command with --execute. If the
+    candidate list changed between preview and execution, execution aborts.
+    """
+    store: MsgStore = ctx.obj["store"]
+    db_path = store.db_path
+    try:
+        retention_days = (
+            days
+            if days is not None
+            else cleanup_mod.retention_days_from_env()
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if retention_days < 1:
+        raise click.ClickException(
+            "retention days must be a positive integer"
+        )
+
+    if not execute:
+        cleanup_mod.release_expired_claims(db_path)
+        plan = cleanup_mod.build_cleanup_plan(db_path, retention_days)
+        cleanup_mod.save_preview(db_path, plan)
+
+        if not plan.candidates:
+            click.echo(
+                f"No threads older than {retention_days} day(s) "
+                "are eligible for cleanup."
+            )
+            return
+
+        click.echo(
+            f"{len(plan.candidates)} thread(s) inactive for more "
+            f"than {retention_days} day(s):"
+        )
+        click.echo(f"{'ID':<10} {'MSGS':<6} {'LAST ACTIVITY':<14} TITLE")
+        click.echo("-" * 60)
+        for candidate in plan.candidates:
+            click.echo(
+                f"{candidate.thread_id[:8]:<10} "
+                f"{candidate.message_count:<6} "
+                f"{_relative_time(candidate.activity_at):<14} "
+                f"{candidate.title}"
+            )
+        click.echo(
+            "\nThreads with pending, claimed, or notified deliveries "
+            "are kept; failed deliveries do not protect a thread.\n"
+            "Run 'msg cleanup --execute"
+            + (f" --days {retention_days}" if days is not None else "")
+            + "' to delete. If this list changes first, "
+            "execution will abort."
+        )
+        return
+
+    state = cleanup_mod.get_cleanup_state(db_path)
+    fingerprint = state.get("preview_fingerprint") if state else None
+    preview_days = (
+        state.get("preview_retention_days") if state else None
+    )
+    if not fingerprint:
+        raise click.ClickException(
+            "run 'msg cleanup' to review the candidate list first"
+        )
+    if preview_days != retention_days:
+        raise click.ClickException(
+            "retention days changed since the preview; "
+            "run 'msg cleanup' again to refresh the list"
+        )
+
+    plan = cleanup_mod.build_cleanup_plan(db_path, retention_days)
+    result = cleanup_mod.execute_cleanup(
+        db_path,
+        plan,
+        expected_fingerprint=fingerprint,
+        source=cleanup_mod.SOURCE_MANUAL,
+    )
+    if result.status == cleanup_mod.STATUS_ABORTED:
+        click.echo(
+            "Aborted: the candidate list changed since the preview. "
+            "Re-run 'msg cleanup' to review the current list.",
+            err=True,
+        )
+        sys.exit(1)
+    if result.status == cleanup_mod.STATUS_FAILED:
+        raise click.ClickException(
+            result.error or "cleanup failed; nothing was partially deleted"
+        )
+    click.echo(
+        f"Deleted {result.threads_deleted} thread(s) "
+        f"({result.messages_deleted} message(s), "
+        f"{result.deliveries_deleted} delivery(ies))."
+    )
 
 
 @cli.command()

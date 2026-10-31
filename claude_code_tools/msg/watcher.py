@@ -34,6 +34,8 @@ SEND_TIMEOUT = 30
 SEND_CLEANUP_TIMEOUT = 5
 SEND_MAX_SECS = SEND_TIMEOUT + SEND_CLEANUP_TIMEOUT
 SEND_LEASE_SECS = SEND_MAX_SECS + 5
+CLEANUP_STARTUP_DELAY = 10.0  # grace before the first daily cleanup check
+CLEANUP_CHECK_INTERVAL = 3600.0  # re-check the once-per-day cleanup gate
 
 
 class Watcher:
@@ -42,10 +44,12 @@ class Watcher:
     def __init__(
         self,
         db_path: str = DEFAULT_DB_PATH,
+        retention_days: int | None = None,
     ) -> None:
         self.store = MsgStore(db_path)
         self.watcher_id = _new_uuid()
         self.pid = os.getpid()
+        self.retention_days = retention_days
         self._running = True
 
     async def run(self) -> None:
@@ -64,6 +68,9 @@ class Watcher:
         heartbeat_task = asyncio.create_task(
             self._heartbeat_loop()
         )
+        cleanup_task = asyncio.create_task(
+            self._cleanup_loop()
+        )
 
         try:
             while self._running:
@@ -71,10 +78,12 @@ class Watcher:
                 await asyncio.sleep(POLL_INTERVAL)
         finally:
             heartbeat_task.cancel()
-            try:
-                await heartbeat_task
-            except asyncio.CancelledError:
-                pass
+            cleanup_task.cancel()
+            for task in (heartbeat_task, cleanup_task):
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
             logger.info("Watcher stopped.")
 
     def _handle_shutdown(self) -> None:
@@ -91,6 +100,39 @@ class Watcher:
             except Exception as e:
                 logger.warning("Heartbeat failed: %s", e)
             await asyncio.sleep(HEARTBEAT_INTERVAL)
+
+    async def _cleanup_loop(self) -> None:
+        """Run the shared old-thread cleanup at most once per UTC day."""
+        from .cleanup import retention_days_from_env, run_due_cleanup
+
+        try:
+            retention_days = (
+                self.retention_days
+                if self.retention_days is not None
+                else retention_days_from_env()
+            )
+        except ValueError as exc:
+            logger.error("Automatic cleanup disabled: %s", exc)
+            return
+
+        await asyncio.sleep(CLEANUP_STARTUP_DELAY)
+        while self._running:
+            try:
+                result = await asyncio.to_thread(
+                    run_due_cleanup, self.store.db_path, retention_days,
+                )
+                if result is not None:
+                    logger.info(
+                        "Daily cleanup %s: %d thread(s), %d message(s), "
+                        "%d delivery(ies)",
+                        result.status,
+                        result.threads_deleted,
+                        result.messages_deleted,
+                        result.deliveries_deleted,
+                    )
+            except Exception as exc:
+                logger.error("Daily cleanup failed: %s", exc)
+            await asyncio.sleep(CLEANUP_CHECK_INTERVAL)
 
     async def _process_pending(self) -> None:
         """Claim and process pending deliveries."""

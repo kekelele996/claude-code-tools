@@ -6,7 +6,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 SCHEMA_STATEMENTS = (
     """CREATE TABLE IF NOT EXISTS agents (
@@ -62,6 +62,24 @@ SCHEMA_STATEMENTS = (
         started_at TEXT NOT NULL,
         last_heartbeat TEXT NOT NULL,
         pid INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS cleanup_audit (
+        id TEXT PRIMARY KEY,
+        ran_at TEXT NOT NULL,
+        source TEXT NOT NULL,
+        status TEXT NOT NULL,
+        retention_days INTEGER NOT NULL,
+        threads_deleted INTEGER NOT NULL,
+        messages_deleted INTEGER NOT NULL,
+        deliveries_deleted INTEGER NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS cleanup_state (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        last_success_at TEXT,
+        last_success_day TEXT,
+        preview_fingerprint TEXT,
+        preview_at TEXT,
+        preview_retention_days INTEGER
     )""",
 )
 
@@ -190,6 +208,13 @@ def initialize_database(conn: sqlite3.Connection) -> None:
                 ) WHERE sender_name IS NULL"""
             )
             conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+
+        if version < 4:
+            conn.execute(
+                "INSERT INTO cleanup_state (singleton) SELECT 1 "
+                "WHERE NOT EXISTS (SELECT 1 FROM cleanup_state)"
+            )
+            conn.execute("PRAGMA user_version = 4")
         conn.commit()
     except BaseException:
         conn.rollback()

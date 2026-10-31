@@ -54,6 +54,24 @@ msg inbox
 This shows all unread messages grouped by thread and
 marks them as read.
 
+## Old Thread Cleanup
+
+Threads older than the retention window are cleaned up
+automatically by the background watcher (once per day), or
+manually after reviewing the list:
+
+```bash
+msg cleanup              # Preview what would be deleted
+msg cleanup --execute    # Delete the previewed threads
+```
+
+Set the retention window with `MSG_RETENTION_DAYS` (default
+30). A thread's age is its newest message or delivery change.
+Threads with a pending, claimed, or notified delivery are
+always kept; failed notifications do not protect a thread.
+If the list changes between preview and execution, execution
+aborts -- run the preview again. Deletions are permanent.
+
 ## Other Commands
 
 ```bash

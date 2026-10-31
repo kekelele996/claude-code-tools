@@ -65,7 +65,9 @@ the same database.
 | `msg inbox` | Show unread messages and mark them read. |
 | `msg thread create TITLE --with a,b` | Start a named thread. |
 | `msg threads` | List active threads. |
-| `msg status` | Watcher health and registered agents. |
+| `msg status` | Watcher health, registered agents, and last cleanup. |
+| `msg cleanup` | Preview old threads eligible for deletion. |
+| `msg cleanup --execute` | Delete the previewed threads. |
 | `msg watch` | Run the watcher daemon in the foreground. |
 
 `msg register` takes `--pane` and `--agent` (`claude` or `codex`) when you want
@@ -140,6 +142,36 @@ msg --local send my-codex "project-local message"
 ```
 
 Agents only see each other inside the same database.
+
+## Retention and cleanup
+
+Old threads are removed automatically by the watcher, and the same rules back
+the manual command:
+
+```bash
+msg cleanup              # show the candidate list, delete nothing
+msg cleanup --execute    # delete the threads shown by the preview
+```
+
+- Retention is configured with the `MSG_RETENTION_DAYS` environment variable
+  (default 30), or per invocation with `msg cleanup --days N`.
+- A thread's age is its **latest activity**: the newest message in the thread
+  or the newest delivery change (created, notified, or read).
+- A thread is kept whole while any delivery is **pending** (waiting to send),
+  **claimed** (notification in flight), or **notified** (the recipient has
+  not read it yet). **Failed** notifications and fully read threads become
+  eligible once they age out.
+- Deletion is atomic per batch — a failure rolls back instead of removing half
+  a thread. After commit the database is checkpointed and rebuilt, so deleted
+  message bodies cannot be recovered from the database directory.
+- The candidate list is snapshotted by the preview. If it changes before
+  `--execute` (new message, delivery change, or different `--days`), execution
+  aborts and deletes nothing; re-run the preview.
+- The watcher runs this cleanup at most once per UTC day. Restarting it on the
+  same day does not repeat the run, even with a fresh process.
+- An audit record stores only the run time, trigger (watcher/manual), status,
+  and deleted counts. Message bodies and thread titles are never written to
+  the audit log. `msg status` shows the most recent run.
 
 ## Using it from an agent
 
